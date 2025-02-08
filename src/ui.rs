@@ -1,5 +1,5 @@
 use crate::error::DashboardError;
-use crate::metrics::UiMessage;
+use crate::metrics::{MetricPoint, UiMessage};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -7,18 +7,22 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState},
+    widgets::{Axis, Block, Borders, Chart, Dataset, List, ListItem, ListState},
     Terminal,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+const MAX_POINTS: usize = 100;
 
 pub struct TuiState {
     discovered_metrics: Vec<String>,
     recent_updates: VecDeque<String>,
     list_state: ListState,
     selected_metric: Option<String>,
+    metric_data: HashMap<String, VecDeque<MetricPoint>>,
+    show_graph: bool,
 }
 
 impl TuiState {
@@ -28,15 +32,28 @@ impl TuiState {
             recent_updates: VecDeque::with_capacity(100),
             list_state: ListState::default(),
             selected_metric: None,
+            metric_data: HashMap::new(),
+            show_graph: false,
         }
     }
 
     fn add_metric(&mut self, metric: String) {
         if !self.discovered_metrics.contains(&metric) {
-            self.discovered_metrics.push(metric);
+            self.discovered_metrics.push(metric.clone());
             self.discovered_metrics.sort();
+            self.metric_data
+                .insert(metric, VecDeque::with_capacity(MAX_POINTS));
             if self.list_state.selected().is_none() {
                 self.list_state.select(Some(0));
+            }
+        }
+    }
+
+    fn add_metric_point(&mut self, name: String, point: MetricPoint) {
+        if let Some(points) = self.metric_data.get_mut(&name) {
+            points.push_back(point);
+            if points.len() > MAX_POINTS {
+                points.pop_front();
             }
         }
     }
@@ -90,11 +107,70 @@ impl TuiState {
             if let Some(metric) = self.discovered_metrics.get(index) {
                 if self.selected_metric.as_ref().map_or(false, |m| m == metric) {
                     self.selected_metric = None;
+                    self.show_graph = false;
                     self.recent_updates.clear();
                 } else {
                     self.selected_metric = Some(metric.clone());
+                    self.show_graph = true;
                     self.recent_updates.clear();
                 }
+            }
+        }
+    }
+    fn render_graph(&self, metric_name: &String, area: Rect, frame: &mut Frame) {
+        if let Some(points) = self.metric_data.get(metric_name) {
+            let data: Vec<(f64, f64)> = points
+                .iter()
+                .map(|point| (point.timestamp as f64, point.value))
+                .collect();
+
+            if !data.is_empty() {
+                let min_x = data.first().map(|p| p.0).unwrap_or(0.0);
+                let max_x = data.last().map(|p| p.0).unwrap_or(0.0);
+                let min_y = data.iter().map(|p| p.1).reduce(f64::min).unwrap_or(0.0);
+                let max_y = data.iter().map(|p| p.1).reduce(f64::max).unwrap_or(0.0);
+
+                // Create labels for Y axis
+                let y_labels = vec![
+                    format!("{:.2}", min_y),
+                    format!("{:.2}", (min_y + max_y) / 2.0),
+                    format!("{:.2}", max_y),
+                ]
+                .into_iter()
+                .map(|s| Span::raw(s))
+                .collect::<Vec<Span>>();
+
+                let x_labels = vec![format!("{:.0}", min_x), format!("{:.0}", max_x)]
+                    .into_iter()
+                    .map(|s| Span::raw(s))
+                    .collect::<Vec<Span>>();
+
+                let dataset = Dataset::default()
+                    .name(metric_name.clone())
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(ratatui::widgets::GraphType::Line)
+                    .data(&data);
+
+                let chart = Chart::new(vec![dataset])
+                    .block(
+                        Block::default()
+                            .title(format!("Metric: {}", metric_name))
+                            .borders(Borders::ALL),
+                    )
+                    .x_axis(
+                        Axis::default()
+                            .title("Time (s)")
+                            .bounds([min_x, max_x])
+                            .labels(x_labels),
+                    )
+                    .y_axis(
+                        Axis::default()
+                            .title("Value")
+                            .bounds([min_y, max_y])
+                            .labels(y_labels),
+                    );
+
+                frame.render_widget(chart, area);
             }
         }
     }
@@ -114,6 +190,7 @@ pub async fn run_tui(mut rx: UnboundedReceiver<UiMessage>) -> Result<(), Dashboa
             match message {
                 UiMessage::NewMetric(metric) => state.add_metric(metric),
                 UiMessage::MetricUpdate(update) => state.add_update(update),
+                UiMessage::MetricDataPoint { name, point } => state.add_metric_point(name, point),
             }
         }
 
@@ -147,20 +224,26 @@ pub async fn run_tui(mut rx: UnboundedReceiver<UiMessage>) -> Result<(), Dashboa
                 .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
             f.render_stateful_widget(metrics_list, chunks[0], &mut state.list_state);
 
-            let updates_title = if let Some(metric) = &state.selected_metric {
-                format!("Recent Updates (Filtered: {})", metric)
+            if state.show_graph {
+                if let Some(metric_name) = &state.selected_metric {
+                    state.render_graph(metric_name, chunks[1], f);
+                }
             } else {
-                "Recent Updates (All Metrics)".to_string()
-            };
+                let updates_title = if let Some(metric) = &state.selected_metric {
+                    format!("Recent Updates (Filtered: {})", metric)
+                } else {
+                    "Recent Updates (All Metrics)".to_string()
+                };
 
-            let updates: Vec<ListItem> = state
-                .recent_updates
-                .iter()
-                .map(|u| ListItem::new(u.as_str()))
-                .collect();
-            let updates_list = List::new(updates)
-                .block(Block::default().title(updates_title).borders(Borders::ALL));
-            f.render_widget(updates_list, chunks[1]);
+                let updates: Vec<ListItem> = state
+                    .recent_updates
+                    .iter()
+                    .map(|u| ListItem::new(u.as_str()))
+                    .collect();
+                let updates_list = List::new(updates)
+                    .block(Block::default().title(updates_title).borders(Borders::ALL));
+                f.render_widget(updates_list, chunks[1]);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
