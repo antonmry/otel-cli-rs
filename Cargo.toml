@@ -5,19 +5,12 @@ edition = "2021"
 description = "CLI tool to receive OpenTelemetry data and visualize it"
 
 [dependencies]
-# OpenTelemetry core dependencies
 opentelemetry-proto = { version = "0.5", features = ["gen-tonic", "metrics"] }
-
-# Async + gRPC
 tonic = "0.11"
 tokio = { version = "1.36", features = ["full"] }
-
-# CLI parsing
 clap = { version = "4.5", features = ["derive"] }
-
-# Error handling
 thiserror = "1.0"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.26.0"
+crossterm = "0.27.0"

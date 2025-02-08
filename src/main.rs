@@ -1,16 +1,30 @@
 use clap::Parser;
-use std::{collections::HashSet, net::SocketAddr, sync::Mutex};
+use std::{collections::{HashSet, VecDeque}, net::SocketAddr};
 use thiserror::Error;
 use tonic::{transport::Server, Request, Response, Status};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     metrics_service_server::{MetricsService, MetricsServiceServer},
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, List, ListItem},
+    Terminal,
+};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use std::io;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 #[derive(Error, Debug)]
 pub enum DashboardError {
     #[error("Failed to start server: {0}")]
     ServerError(#[from] tonic::transport::Error),
+    #[error("IO error: {0}")]
+    IoError(#[from] io::Error),
 }
 
 #[derive(Parser, Debug)]
@@ -24,129 +38,32 @@ struct Args {
 }
 
 #[derive(Debug)]
+enum UiMessage {
+    NewMetric(String),
+    MetricUpdate(String),
+}
+
 struct MetricsReceiver {
-    seen_metrics: Mutex<HashSet<String>>,
+    seen_metrics: TokioMutex<HashSet<String>>,
     debug_mode: bool,
+    ui_tx: mpsc::UnboundedSender<UiMessage>, // Changed to UnboundedSender
 }
 
 impl MetricsReceiver {
-    fn new(debug_mode: bool) -> Self {
+    fn new(debug_mode: bool, ui_tx: mpsc::UnboundedSender<UiMessage>) -> Self {
         Self {
-            seen_metrics: Mutex::new(HashSet::new()),
+            seen_metrics: TokioMutex::new(HashSet::new()),
             debug_mode,
+            ui_tx,
         }
     }
 
-    fn print_debug_metric(&self, resource_metrics: &opentelemetry_proto::tonic::metrics::v1::ResourceMetrics, 
-                         scope_metrics: &opentelemetry_proto::tonic::metrics::v1::ScopeMetrics, 
-                         metric: &opentelemetry_proto::tonic::metrics::v1::Metric) {
-        println!("\n=== Detailed Metric Information ===");
-        
-        // Print Resource information
-        if let Some(resource) = &resource_metrics.resource {
-            println!("Resource Attributes:");
-            for attr in &resource.attributes {
-                if let Some(value) = &attr.value {
-                    println!("\t{} = {:?}", attr.key, value.value);
-                }
-            }
+    async fn send_metric_update(&self, metric_name: &str, details: String) {
+        if let Err(e) = self.ui_tx.send(UiMessage::MetricUpdate(
+            format!("{}: {}", metric_name, details)
+        )) {
+            eprintln!("Failed to send metric update: {}", e);
         }
-
-        // Print Scope information
-        if let Some(scope) = &scope_metrics.scope {
-            println!("\nInstrumentation Scope:");
-            println!("\tName: {}", scope.name);
-            println!("\tVersion: {}", scope.version);
-            if !scope.attributes.is_empty() {
-                println!("\tAttributes:");
-                for attr in &scope.attributes {
-                    if let Some(value) = &attr.value {
-                        println!("\t\t{} = {:?}", attr.key, value.value);
-                    }
-                }
-            }
-        }
-
-        // Print Metric details
-        println!("\nMetric Details:");
-        println!("\tName: {}", metric.name);
-        println!("\tDescription: {}", metric.description);
-        println!("\tUnit: {}", metric.unit);
-
-        match &metric.data {
-            Some(data) => {
-                match data {
-                    opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge) => {
-                        println!("\tType: Gauge");
-                        for point in &gauge.data_points {
-                            println!("\tDataPoint:");
-                            println!("\t\tValue: {:?}", point.value);
-                            if !point.attributes.is_empty() {
-                                println!("\t\tAttributes:");
-                                for attr in &point.attributes {
-                                    if let Some(value) = &attr.value {
-                                        println!("\t\t\t{} = {:?}", attr.key, value.value);
-                                    }
-                                }
-                            }
-                            println!("\t\tTime: {:?}", point.time_unix_nano);
-                            if point.start_time_unix_nano != 0 {
-                                println!("\t\tStart Time: {:?}", point.start_time_unix_nano);
-                            }
-                        }
-                    },
-                    opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
-                        println!("\tType: Sum");
-                        println!("\tIs Monotonic: {}", sum.is_monotonic);
-                        println!("\tAggregation Temporality: {:?}", sum.aggregation_temporality);
-                        for point in &sum.data_points {
-                            println!("\tDataPoint:");
-                            println!("\t\tValue: {:?}", point.value);
-                            if !point.attributes.is_empty() {
-                                println!("\t\tAttributes:");
-                                for attr in &point.attributes {
-                                    if let Some(value) = &attr.value {
-                                        println!("\t\t\t{} = {:?}", attr.key, value.value);
-                                    }
-                                }
-                            }
-                            println!("\t\tTime: {:?}", point.time_unix_nano);
-                            if point.start_time_unix_nano != 0 {
-                                println!("\t\tStart Time: {:?}", point.start_time_unix_nano);
-                            }
-                        }
-                    },
-                    opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
-                        println!("\tType: Histogram");
-                        println!("\tAggregation Temporality: {:?}", hist.aggregation_temporality);
-                        for point in &hist.data_points {
-                            println!("\tDataPoint:");
-                            println!("\t\tCount: {}", point.count);
-                            println!("\t\tSum: {:?}", point.sum);
-                            if !point.bucket_counts.is_empty() {
-                                println!("\t\tBucket Counts: {:?}", point.bucket_counts);
-                                println!("\t\tBucket Boundaries: {:?}", point.explicit_bounds);
-                            }
-                            if !point.attributes.is_empty() {
-                                println!("\t\tAttributes:");
-                                for attr in &point.attributes {
-                                    if let Some(value) = &attr.value {
-                                        println!("\t\t\t{} = {:?}", attr.key, value.value);
-                                    }
-                                }
-                            }
-                            println!("\t\tTime: {:?}", point.time_unix_nano);
-                            if point.start_time_unix_nano != 0 {
-                                println!("\t\tStart Time: {:?}", point.start_time_unix_nano);
-                            }
-                        }
-                    },
-                    _ => println!("\tOther metric type"),
-                }
-            },
-            None => println!("\tNo data"),
-        }
-        println!("===============================");
     }
 }
 
@@ -157,17 +74,45 @@ impl MetricsService for MetricsReceiver {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         let metrics = request.into_inner();
-        let mut seen_metrics = self.seen_metrics.lock().unwrap();
+        let mut seen_metrics = self.seen_metrics.lock().await;
         
         for resource_metrics in metrics.resource_metrics {
             for scope_metrics in &resource_metrics.scope_metrics {
                 for metric in &scope_metrics.metrics {
                     if seen_metrics.insert(metric.name.clone()) {
-                        println!("Discovered metric: {}", metric.name);
+                        if let Err(e) = self.ui_tx.send(UiMessage::NewMetric(metric.name.clone())) {
+                            eprintln!("Failed to send new metric: {}", e);
+                        }
                     }
                     
-                    if self.debug_mode {
-                        self.print_debug_metric(&resource_metrics, scope_metrics, metric);
+                    match &metric.data {
+                        Some(data) => {
+                            match data {
+                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge) => {
+                                    for point in &gauge.data_points {
+                                        self.send_metric_update(&metric.name, 
+                                            format!("= {:?}", point.value)
+                                        ).await;
+                                    }
+                                },
+                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
+                                    for point in &sum.data_points {
+                                        self.send_metric_update(&metric.name, 
+                                            format!("= {:?}", point.value)
+                                        ).await;
+                                    }
+                                },
+                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
+                                    for point in &hist.data_points {
+                                        self.send_metric_update(&metric.name, 
+                                            format!("count: {}, sum: {:?}", point.count, point.sum)
+                                        ).await;
+                                    }
+                                },
+                                _ => {}
+                            }
+                        },
+                        None => {}
                     }
                 }
             }
@@ -175,6 +120,93 @@ impl MetricsService for MetricsReceiver {
 
         Ok(Response::new(ExportMetricsServiceResponse::default()))
     }
+}
+
+struct TuiState {
+    discovered_metrics: HashSet<String>,
+    recent_updates: VecDeque<String>,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            discovered_metrics: HashSet::new(),
+            recent_updates: VecDeque::with_capacity(100),
+        }
+    }
+
+    fn add_metric(&mut self, metric: String) {
+        self.discovered_metrics.insert(metric);
+    }
+
+    fn add_update(&mut self, update: String) {
+        self.recent_updates.push_front(update);
+        if self.recent_updates.len() > 100 {
+            self.recent_updates.pop_back();
+        }
+    }
+}
+
+async fn run_tui(mut rx: mpsc::UnboundedReceiver<UiMessage>) -> Result<(), DashboardError> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = TuiState::new();
+
+    loop {
+        // Process all pending messages
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                UiMessage::NewMetric(metric) => state.add_metric(metric),
+                UiMessage::MetricUpdate(update) => state.add_update(update),
+            }
+        }
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(70),
+                ].as_ref())
+                .split(f.size());
+
+            let metrics: Vec<ListItem> = state.discovered_metrics.iter()
+                .map(|m| ListItem::new(m.as_str()))
+                .collect();
+            let metrics_list = List::new(metrics)
+                .block(Block::default().title("Discovered Metrics").borders(Borders::ALL));
+            f.render_widget(metrics_list, chunks[0]);
+
+            let updates: Vec<ListItem> = state.recent_updates.iter()
+                .map(|u| ListItem::new(u.as_str()))
+                .collect();
+            let updates_list = List::new(updates)
+                .block(Block::default().title("Recent Updates").borders(Borders::ALL));
+            f.render_widget(updates_list, chunks[1]);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') {
+                    break;
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -186,15 +218,24 @@ async fn main() -> Result<(), DashboardError> {
         .with_env_filter(log_level)
         .init();
 
+    let (tx, rx) = mpsc::unbounded_channel(); // Changed to unbounded channel
+    let tui_handle = tokio::spawn(run_tui(rx));
+
     let addr = args.address;
-    let metrics_service = MetricsServiceServer::new(MetricsReceiver::new(args.debug));
+    let metrics_service = MetricsServiceServer::new(MetricsReceiver::new(args.debug, tx));
 
     tracing::info!("Starting OTLP receiver on {}", addr);
 
-    Server::builder()
-        .add_service(metrics_service)
-        .serve(addr)
-        .await?;
+    let server_handle = tokio::spawn(
+        Server::builder()
+            .add_service(metrics_service)
+            .serve(addr)
+    );
+
+    tokio::select! {
+        _ = tui_handle => println!("TUI closed"),
+        _ = server_handle => println!("Server closed"),
+    }
 
     Ok(())
 }
