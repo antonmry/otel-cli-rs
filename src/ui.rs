@@ -13,6 +13,7 @@ use ratatui::{
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use tokio::sync::mpsc::UnboundedReceiver;
+use chrono::{NaiveDateTime, Timelike};
 
 const MAX_POINTS: usize = 100;
 
@@ -117,6 +118,7 @@ impl TuiState {
             }
         }
     }
+
     fn render_graph(&self, metric_name: &String, area: Rect, frame: &mut Frame) {
         if let Some(points) = self.metric_data.get(metric_name) {
             let data: Vec<(f64, f64)> = points
@@ -140,9 +142,14 @@ impl TuiState {
                 .map(|s| Span::raw(s))
                 .collect::<Vec<Span>>();
 
-                let x_labels = vec![format!("{:.0}", min_x), format!("{:.0}", max_x)]
+                // Create labels for X axis with formatted timestamps
+                let x_labels = vec![min_x, (min_x + max_x) / 2.0, max_x]
                     .into_iter()
-                    .map(|s| Span::raw(s))
+                    .map(|ts| {
+                        let datetime = NaiveDateTime::from_timestamp(ts as i64, 0);
+                        let formatted_time = format!("{:02}:{:02}:{:02}", datetime.hour(), datetime.minute(), datetime.second());
+                        Span::raw(formatted_time)
+                    })
                     .collect::<Vec<Span>>();
 
                 let dataset = Dataset::default()
@@ -159,7 +166,7 @@ impl TuiState {
                     )
                     .x_axis(
                         Axis::default()
-                            .title("Time (s)")
+                            .title("Time (hh:mm:ss)")
                             .bounds([min_x, max_x])
                             .labels(x_labels),
                     )
@@ -175,7 +182,6 @@ impl TuiState {
         }
     }
 }
-
 pub async fn run_tui(mut rx: UnboundedReceiver<UiMessage>) -> Result<(), DashboardError> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
