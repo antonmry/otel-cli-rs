@@ -1,0 +1,39 @@
+version: otel_dataflow/v1
+engine: { }
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+
+        nodes:
+          receiver:
+            type: otlp:receiver
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "0.0.0.0:5317"
+                http:
+                  listening_addr: "0.0.0.0:5318"
+          exporter:
+            type: parquet:exporter
+            config:
+              storage:
+                s3:
+                  base_uri: s3://OTEL_S3_BUCKET/test
+                  region: eu-west-1
+                  auth:
+                    type: default
+              partitioning_strategies:
+                - schema_metadata: ["_part_id"]
+              writer_options:
+                flush_when_older_than: 10s
+
+        connections:
+          - from: receiver
+            to: exporter
