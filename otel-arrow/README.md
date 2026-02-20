@@ -1,14 +1,14 @@
-# E2E Test: OTLP → Parquet → S3
+# E2E Test: OTLP → Parquet → S3/Azure
 
-End-to-end test of the S3 parquet exporter using a real AWS account with
+End-to-end test of the parquet exporter using a real AWS or Azure account with
 the OTel Python SDK as the telemetry source and DataFusion for querying results.
 
 ## Prerequisites
 
 - Rust >= 1.87.0
 - [uv](https://github.com/astral-sh/uv) (Python script runner)
-- AWS CLI v2
-- An AWS account with S3 access
+- **For S3**: AWS CLI v2 and an AWS account with S3 access
+- **For Azure**: Azure CLI and an Azure account with Blob Storage access
 
 ## Step 1: Configure Environment
 
@@ -45,7 +45,7 @@ aws s3 ls | grep $OTEL_S3_BUCKET
 
 ```bash
 cd otel-arrow/rust/otap-dataflow
-cargo install --features aws --path .
+cargo install --features aws,azure --path .
 ```
 
 ## Step 4: Generate Config Files
@@ -81,6 +81,38 @@ To auto-generate telemetry without an external sender:
 ```bash
 df_engine -c fake-parquet-s3.gen.yaml
 ```
+
+### Azure Blob Storage variant
+
+To use Azure Blob Storage instead of S3, authenticate with the Azure CLI
+and ensure your identity has the **Storage Blob Data Contributor** role on the
+storage account:
+
+```bash
+az login
+
+# Find your subscription ID and resource group
+az account show --query id -o tsv
+az resource list --name otelarrowtest \
+  --resource-type Microsoft.Storage/storageAccounts --query "[0].resourceGroup" -o tsv
+
+# Assign the role (replace <user-id>, <subscription-id>, and <resource-group>)
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee $(az ad signed-in-user show --query id -o tsv) \
+  --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/otelarrowtest
+```
+
+Wait ~1-2 minutes for the role assignment to propagate, then start the
+collector:
+
+```bash
+df_engine -c fake-parquet-azure.yaml
+```
+
+This exports parquet files to an Azure Blob Storage container using
+`azure_cli` authentication. No `gen_config.py` step is needed since the
+Azure config has the storage URI hardcoded.
 
 ## Step 6: Send Telemetry
 
@@ -146,14 +178,16 @@ aws s3 rb s3://$OTEL_S3_BUCKET
 | No parquet files after 15s             | Check collector logs for S3 write errors. Common issues: wrong region, insufficient IAM permissions (`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`)                                                   |
 | `query_s3.py` finds no files           | Ensure `OTEL_S3_BUCKET` is set. List files with `aws s3 ls --recursive` first. Check that parquet files exist in subdirectories (`logs/`, `log_attrs/`, `resource_attrs/`)                              |
 | Permission denied on S3                | The IAM user/role needs at minimum: `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on the bucket                                                                                                       |
+| 403 AuthorizationPermissionMismatch on Azure | Your Azure CLI identity needs the **Storage Blob Data Contributor** role on the storage account. Assign it and wait ~1-2 min for propagation              |
 
 ## Files Reference
 
-| File                   | Purpose                                                     |
-| ---------------------- | ----------------------------------------------------------- |
-| `otlp-parquet-s3.yaml` | Template: OTLP receiver → S3 parquet exporter               |
-| `fake-parquet-s3.yaml` | Template: traffic generator → S3 parquet exporter           |
-| `fake-parquet.yaml`    | Template: traffic generator → local parquet exporter        |
-| `gen_config.py`        | Generates `*.gen.yaml` from templates with your bucket name |
-| `send_telemetry.py`    | Sends traces, metrics, and logs via OTLP gRPC               |
-| `query_s3.py`          | Queries parquet files from S3 using DataFusion              |
+| File                     | Purpose                                                        |
+| ------------------------ | -------------------------------------------------------------- |
+| `otlp-parquet-s3.yaml`   | Template: OTLP receiver → S3 parquet exporter                  |
+| `fake-parquet-s3.yaml`   | Template: traffic generator → S3 parquet exporter              |
+| `fake-parquet-azure.yaml`| Config: traffic generator → Azure Blob Storage parquet exporter|
+| `fake-parquet.yaml`      | Template: traffic generator → local parquet exporter           |
+| `gen_config.py`          | Generates `*.gen.yaml` from templates with your bucket name    |
+| `send_telemetry.py`      | Sends traces, metrics, and logs via OTLP gRPC                  |
+| `query_s3.py`            | Queries parquet files from S3 using DataFusion                 |
